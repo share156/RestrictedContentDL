@@ -8,9 +8,12 @@ import asyncio
 from time import time
 
 from pyleaves import Leaves
-from pyrogram.enums import ParseMode
+from pyrogram.enums import ParseMode, ChatType
 from pyrogram import Client, filters
-from pyrogram.errors import PeerIdInvalid, BadRequest, FloodWait
+from pyrogram.errors import (
+    PeerIdInvalid, BadRequest, FloodWait,
+    SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired
+)
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
 from helpers.utils import (
@@ -39,10 +42,23 @@ from helpers.msg import (
     get_raw_text
 )
 
+from helpers.user_sessions import (
+    get_user_client,
+    set_login_state,
+    get_login_state,
+    clear_login_state,
+    ACTIVE_LOGINS,
+    USER_STATES,
+    save_session,
+    delete_session,
+    stop_user_client,
+    get_session,
+)
+
 from config import PyroConf
 from logger import LOGGER
 
-# Initialize the bot client
+# --------------- Initialize the bot client ---------------
 bot = Client(
     "media_bot",
     api_id=PyroConf.API_ID,
@@ -50,19 +66,11 @@ bot = Client(
     bot_token=PyroConf.BOT_TOKEN,
     workers=100,
     parse_mode=ParseMode.MARKDOWN,
-    max_concurrent_transmissions=1, # ✅ SAFE DEFAULT
+    max_concurrent_transmissions=1,
     sleep_threshold=30,
 )
 
-# Client for user session
-user = Client(
-    "user_session",
-    workers=100,
-    session_string=PyroConf.SESSION_STRING,
-    max_concurrent_transmissions=1, # ✅ SAFE DEFAULT
-    sleep_threshold=30,
-)
-
+# Global task and concurrency controls
 RUNNING_TASKS = set()
 download_semaphore = None
 forward_chat_id = None
@@ -75,6 +83,7 @@ def track_task(coro):
     task.add_done_callback(_remove)
     return task
 
+# --------------- Command Handlers (unchanged except where noted) ---------------
 
 @bot.on_message(filters.command("start") & filters.private)
 async def start(_, message: Message):
@@ -85,49 +94,40 @@ async def start(_, message: Message):
         "Just send me a link (paste it directly or use `/dl <link>` for posts /\n"
         "`/dls <link>` for stories).\n\n"
         "ℹ️ Use `/help` to view all commands and examples.\n"
-        "🔒 Make sure the user client is part of the chat / follows the user.\n\n"
+        "🔒 Make sure you **/login** with your own Telegram account to access restricted content.\n\n"
         "Ready? Send me a Telegram post or story link!"
     )
-
     markup = InlineKeyboardMarkup(
         [[InlineKeyboardButton("Update Channel", url="https://t.me/itsSmartDev")]]
     )
     await message.reply(welcome_text, reply_markup=markup, disable_web_page_preview=True)
-
 
 @bot.on_message(filters.command("help") & filters.private)
 async def help_command(_, message: Message):
     help_text = (
         "💡 **Media Downloader Bot Help**\n\n"
         "➤ **Download Media**\n"
-        "   – Send `/dl <post_URL>` **or** just paste a Telegram post link to fetch photos, videos, audio, or documents.\n\n"
+        "   – Send `/dl <post_URL>` **or** just paste a Telegram post link.\n\n"
         "➤ **Batch Download**\n"
-        "   – Send `/bdl start_link end_link` to grab a series of posts in one go.\n"
-        "     💡 Example: `/bdl https://t.me/mychannel/100 https://t.me/mychannel/120`\n"
-        "**It will download all posts from ID 100 to 120.**\n\n"
+        "   – Send `/bdl start_link end_link` to grab a series of posts.\n\n"
         "➤ **Download Story**\n"
-        "   – Send `/dls <story_URL>` **or** just paste a Telegram story link to fetch a restricted story (photo or video).\n"
-        "     💡 Example: `/dls https://t.me/username/s/12`\n\n"
+        "   – Send `/dls <story_URL>` or paste a story link.\n\n"
         "➤ **Batch Story Download**\n"
-        "   – Send `/bdls start_link end_link` to grab a range of stories from the same user/channel.\n"
-        "     💡 Example: `/bdls https://t.me/username/s/10 https://t.me/username/s/25`\n\n"
-        "➤ **Requirements**\n"
-        "   – Make sure the user client is part of the chat (or follows the user for stories).\n\n"
-        "➤ **If the bot hangs**\n"
-        "   – Send `/killall` to cancel any pending downloads.\n\n"
-        "➤ **Logs**\n"
-        "   – Send `/logs` to download the bot’s logs file.\n\n"
-        "➤ **Cleanup**\n"
-        "   – Send `/cleanup` to remove temporary downloaded files from disk.\n\n"
-        "➤ **Stats**\n"
-        "   – Send `/stats` to view current status"
+        "   – Send `/bdls start_link end_link` for a range of stories.\n\n"
+        "➤ **Login / Logout**\n"
+        "   – `/login` to connect your own Telegram account (needed for private channels / restricted stories).\n"
+        "   – `/logout` to remove your session.\n"
+        "   – `/cancel` to abort an ongoing login or all active downloads.\n\n"
+        "➤ **Other Commands**\n"
+        "   – `/killall` cancel pending downloads.\n"
+        "   – `/stats` system stats.\n"
+        "   – `/logs` download logs.\n"
+        "   – `/cleanup` remove temp files."
     )
-    
     markup = InlineKeyboardMarkup(
         [[InlineKeyboardButton("Update Channel", url="https://t.me/itsSmartDev")]]
     )
     await message.reply(help_text, reply_markup=markup, disable_web_page_preview=True)
-
 
 @bot.on_message(filters.command("cleanup") & filters.private)
 async def cleanup_storage(_, message: Message):
@@ -141,12 +141,158 @@ async def cleanup_storage(_, message: Message):
         )
     except Exception as e:
         LOGGER(__name__).error(f"Cleanup failed: {e}")
-        return await message.reply("❌ **Cleanup failed.** Check logs for details.")
+        return await message.reply("❌ **Cleanup failed.** Check /logs for details.")
 
+# --------------- Multi‑User Login/Logout/Cancel ---------------
+
+@bot.on_message(filters.command("login") & filters.private)
+async def start_login(bot: Client, message: Message):
+    user_id = message.from_user.id
+    existing = await get_session(user_id)
+    if existing:
+        return await message.reply("You are already logged in! Use /logout first.")
+    set_login_state(user_id, "WAITING_API_ID")
+    ACTIVE_LOGINS[user_id] = {}
+    await message.reply(
+        "🔑 **Login Process Started**\n\n"
+        "Please send your **API ID** (integer) from my.telegram.org."
+    )
+
+@bot.on_message(filters.command("logout") & filters.private)
+async def logout_user(bot: Client, message: Message):
+    user_id = message.from_user.id
+    await stop_user_client(user_id)
+    await delete_session(user_id)
+    clear_login_state(user_id)
+    await message.reply("🗑️ Your session has been removed.")
+
+@bot.on_message(filters.command("cancel") & filters.private)
+async def cancel_action(bot: Client, message: Message):
+    user_id = message.from_user.id
+    # Cancel any ongoing login flow
+    if get_login_state(user_id):
+        clear_login_state(user_id)
+        await message.reply("✅ Login process cancelled.")
+    else:
+        # Cancel all active download tasks for the user (globally killall)
+        cancelled = 0
+        for task in list(RUNNING_TASKS):
+            if not task.done():
+                task.cancel()
+                cancelled += 1
+        await message.reply(f"🛑 Cancelled {cancelled} running task(s).")
+
+# --------------- Login Conversation Handler ---------------
+
+@bot.on_message(filters.text & filters.private)
+async def login_conversation(bot: Client, message: Message):
+    user_id = message.from_user.id
+    state = get_login_state(user_id)
+    if not state:
+        # Not in a login flow – let other handlers process it
+        return
+
+    text = message.text.strip()
+
+    if state == "WAITING_API_ID":
+        if not text.isdigit():
+            return await message.reply("❌ API ID must be a number. Send again:")
+        ACTIVE_LOGINS[user_id]["api_id"] = int(text)
+        set_login_state(user_id, "WAITING_API_HASH")
+        await message.reply("✅ Got API ID. Now send your **API Hash** (string):")
+
+    elif state == "WAITING_API_HASH":
+        if len(text) < 10:
+            return await message.reply("❌ Invalid API Hash. Send again:")
+        ACTIVE_LOGINS[user_id]["api_hash"] = text
+        set_login_state(user_id, "WAITING_PHONE")
+        await message.reply("✅ Got API Hash. Now send your **Phone Number** (international format, e.g. +1234567890):")
+
+    elif state == "WAITING_PHONE":
+        if not text.startswith("+"):
+            return await message.reply("❌ Phone number must include country code (+...). Send again:")
+        ACTIVE_LOGINS[user_id]["phone"] = text
+        await message.reply("⏳ Connecting to Telegram...")
+        try:
+            temp_client = Client(
+                name=f"login_{user_id}",
+                api_id=ACTIVE_LOGINS[user_id]["api_id"],
+                api_hash=ACTIVE_LOGINS[user_id]["api_hash"],
+                in_memory=True
+            )
+            await temp_client.connect()
+            code_info = await temp_client.send_code(text)
+            ACTIVE_LOGINS[user_id]["client"] = temp_client
+            ACTIVE_LOGINS[user_id]["phone_code_hash"] = code_info.phone_code_hash
+            set_login_state(user_id, "WAITING_OTP")
+            await message.reply("📩 Verification code sent. Please enter the **OTP**:")
+        except Exception as e:
+            clear_login_state(user_id)
+            await message.reply(f"❌ Failed to send code: `{e}`")
+
+    elif state == "WAITING_OTP":
+        otp = text.replace(" ", "")
+        login_data = ACTIVE_LOGINS[user_id]
+        temp_client = login_data["client"]
+        try:
+            await temp_client.sign_in(
+                phone_number=login_data["phone"],
+                phone_code_hash=login_data["phone_code_hash"],
+                phone_code=otp
+            )
+            session_str = await temp_client.export_session_string()
+            await save_session(
+                user_id=user_id,
+                api_id=login_data["api_id"],
+                api_hash=login_data["api_hash"],
+                session_string=session_str
+            )
+            await temp_client.disconnect()
+            clear_login_state(user_id)
+            await message.reply("🎉 **Login successful!** You can now use the bot.")
+        except SessionPasswordNeeded:
+            set_login_state(user_id, "WAITING_2FA")
+            await message.reply("🔐 Two‑factor authentication enabled. Please send your **password**:")
+        except (PhoneCodeInvalid, PhoneCodeExpired):
+            await message.reply("❌ Code invalid or expired. Send the OTP again:")
+        except Exception as e:
+            clear_login_state(user_id)
+            await message.reply(f"❌ Login error: `{e}`")
+
+    elif state == "WAITING_2FA":
+        password = text
+        login_data = ACTIVE_LOGINS[user_id]
+        temp_client = login_data["client"]
+        try:
+            await temp_client.check_password(password=password)
+            session_str = await temp_client.export_session_string()
+            await save_session(
+                user_id=user_id,
+                api_id=login_data["api_id"],
+                api_hash=login_data["api_hash"],
+                session_string=session_str
+            )
+            await temp_client.disconnect()
+            clear_login_state(user_id)
+            await message.reply("🎉 **Login successful!**")
+        except Exception as e:
+            await message.reply(f"❌ Password verification failed: `{e}`")
+
+    else:
+        clear_login_state(user_id)
+        await message.reply("⚠️ Something went wrong; login cancelled.")
+
+# --------------- Core Download Logic (modified for per‑user client) ---------------
 
 async def handle_download(bot: Client, message: Message, post_url: str):
     global forward_chat_id
     async with download_semaphore:
+        # --- Obtain the requesting user’s client ---
+        user_id = message.from_user.id
+        user_client = await get_user_client(user_id)
+        if not user_client:
+            return await message.reply("❌ You need to /login first to access restricted content.")
+
         if "?" in post_url:
             post_url = post_url.split("?", 1)[0]
 
@@ -163,7 +309,7 @@ async def handle_download(bot: Client, message: Message, post_url: str):
                     effective_forward_chat_id = forward_chat_id
 
             chat_id, message_id = getChatMsgID(post_url)
-            chat_message = await user.get_messages(chat_id=chat_id, message_ids=message_id)
+            chat_message = await user_client.get_messages(chat_id=chat_id, message_ids=message_id)
 
             LOGGER(__name__).info(f"Downloading media from URL: {post_url}")
 
@@ -177,7 +323,7 @@ async def handle_download(bot: Client, message: Message, post_url: str):
                 )
 
                 if not await fileSizeLimit(
-                    file_size, message, "download", user.me.is_premium
+                    file_size, message, "download", user_client.me.is_premium
                 ):
                     return
 
@@ -189,10 +335,11 @@ async def handle_download(bot: Client, message: Message, post_url: str):
             )
 
             if chat_message.media_group_id:
-                if not await processMediaGroup(chat_message, bot, message, forward_chat_id=effective_forward_chat_id):
-                    await message.reply(
-                        "**Could not extract any valid media from the media group.**"
-                    )
+                if not await processMediaGroup(
+                    chat_message, bot, message,
+                    user_client=user_client, forward_chat_id=effective_forward_chat_id
+                ):
+                    await message.reply("**Could not extract any valid media from the media group.**")
                 return
 
             has_downloadable_media = (
@@ -328,6 +475,11 @@ async def handle_download(bot: Client, message: Message, post_url: str):
 async def handle_story_download(bot: Client, message: Message, story_url: str):
     global forward_chat_id
     async with download_semaphore:
+        user_id = message.from_user.id
+        user_client = await get_user_client(user_id)
+        if not user_client:
+            return await message.reply("❌ You need to /login first to access restricted stories.")
+
         if "?" in story_url:
             story_url = story_url.split("?", 1)[0]
 
@@ -348,7 +500,7 @@ async def handle_story_download(bot: Client, message: Message, story_url: str):
             story = None
             for attempt in range(2):
                 try:
-                    story = await user.get_stories(
+                    story = await user_client.get_stories(
                         chat_id=chat_username, story_ids=story_id
                     )
                     break
@@ -374,14 +526,12 @@ async def handle_story_download(bot: Client, message: Message, story_url: str):
 
             if story.video:
                 if not await fileSizeLimit(
-                    story.video.file_size, message, "download", user.me.is_premium
+                    story.video.file_size, message, "download", user_client.me.is_premium
                 ):
                     return
 
             if not (story.photo or story.video):
-                await message.reply(
-                    "**This story has no downloadable media.**"
-                )
+                await message.reply("**This story has no downloadable media.**")
                 return
 
             raw_caption, raw_caption_entities = get_raw_text(
@@ -416,9 +566,7 @@ async def handle_story_download(bot: Client, message: Message, story_url: str):
                     raise
 
             if not media_path or not os.path.exists(media_path):
-                await progress_message.edit(
-                    "**❌ Download failed: File not saved properly**"
-                )
+                await progress_message.edit("**❌ Download failed: File not saved properly**")
                 return
 
             file_size = os.path.getsize(media_path)
@@ -427,9 +575,7 @@ async def handle_story_download(bot: Client, message: Message, story_url: str):
                 cleanup_download(media_path)
                 return
 
-            LOGGER(__name__).info(
-                f"Downloaded story: {media_path} (Size: {file_size} bytes)"
-            )
+            LOGGER(__name__).info(f"Downloaded story: {media_path} (Size: {file_size} bytes)")
 
             media_type = "video" if story.video else "photo"
             await send_media(
@@ -475,15 +621,15 @@ async def handle_story_download(bot: Client, message: Message, story_url: str):
             await message.reply("**❌ An unexpected error occurred.** Check /logs for details.")
 
 
+# --------------- Command Handlers for /dl /dls /bdl /bdls ---------------
+
 @bot.on_message(filters.command("dl") & filters.private)
 async def download_media(bot: Client, message: Message):
     if len(message.command) < 2:
         await message.reply("**Provide a post URL after the /dl command.**")
         return
-
     post_url = message.command[1]
     await track_task(handle_download(bot, message, post_url))
-
 
 @bot.on_message(filters.command("dls") & filters.private)
 async def download_story(bot: Client, message: Message):
@@ -493,7 +639,6 @@ async def download_story(bot: Client, message: Message):
             "💡 Example: `/dls https://t.me/username/s/12`"
         )
         return
-
     story_url = message.command[1]
     if not is_story_link(story_url):
         await message.reply(
@@ -501,14 +646,11 @@ async def download_story(bot: Client, message: Message):
             "Expected format: `https://t.me/<username>/s/<story_id>`"
         )
         return
-
     await track_task(handle_story_download(bot, message, story_url))
-
 
 @bot.on_message(filters.command("bdls") & filters.private)
 async def download_story_range(bot: Client, message: Message):
     args = message.text.split()
-
     if len(args) != 3 or not all(is_story_link(arg) for arg in args[1:]):
         await message.reply(
             "🚀 **Batch Story Download**\n"
@@ -525,18 +667,12 @@ async def download_story_range(bot: Client, message: Message):
         return await message.reply(f"**❌ Error parsing links:\n{e}**")
 
     if start_chat.lower() != end_chat.lower():
-        return await message.reply(
-            "**❌ Both links must be from the same user/channel.**"
-        )
+        return await message.reply("**❌ Both links must be from the same user/channel.**")
     if start_id > end_id:
-        return await message.reply(
-            "**❌ Invalid range: start ID cannot exceed end ID.**"
-        )
+        return await message.reply("**❌ Invalid range: start ID cannot exceed end ID.**")
 
     prefix = f"https://t.me/{start_chat}/s"
-    loading = await message.reply(
-        f"📥 **Downloading stories {start_id}–{end_id}…**"
-    )
+    loading = await message.reply(f"📥 **Downloading stories {start_id}–{end_id}…**")
 
     downloaded = failed = 0
     batch_tasks = []
@@ -560,7 +696,6 @@ async def download_story_range(bot: Client, message: Message):
                     LOGGER(__name__).error(f"Error: {result}")
                 else:
                     downloaded += 1
-
             batch_tasks.clear()
             await asyncio.sleep(PyroConf.FLOOD_WAIT_DELAY)
 
@@ -580,11 +715,9 @@ async def download_story_range(bot: Client, message: Message):
         f"❌ **Failed**     : `{failed}` error(s)"
     )
 
-
 @bot.on_message(filters.command("bdl") & filters.private)
 async def download_range(bot: Client, message: Message):
     args = message.text.split()
-
     if len(args) != 3 or not all(arg.startswith("https://t.me/") for arg in args[1:]):
         await message.reply(
             "🚀 **Batch Download Process**\n"
@@ -605,10 +738,9 @@ async def download_range(bot: Client, message: Message):
     if start_id > end_id:
         return await message.reply("**❌ Invalid range: start ID cannot exceed end ID.**")
 
-    try:
-        await user.get_chat(start_chat)
-    except Exception:
-        pass
+    # Pre-check user client availability
+    if not await get_user_client(message.from_user.id):
+        return await message.reply("❌ Login required for batch download.")
 
     prefix = args[1].rsplit("/", 1)[0]
     loading = await message.reply(f"📥 **Downloading posts {start_id}–{end_id}…**")
@@ -621,7 +753,10 @@ async def download_range(bot: Client, message: Message):
     for msg_id in range(start_id, end_id + 1):
         url = f"{prefix}/{msg_id}"
         try:
-            chat_msg = await user.get_messages(chat_id=start_chat, message_ids=msg_id)
+            user_client = await get_user_client(message.from_user.id)
+            if not user_client:
+                raise Exception("User logged out during batch")
+            chat_msg = await user_client.get_messages(chat_id=start_chat, message_ids=msg_id)
             if not chat_msg:
                 skipped += 1
                 continue
@@ -654,7 +789,6 @@ async def download_range(bot: Client, message: Message):
                         LOGGER(__name__).error(f"Error: {result}")
                     else:
                         downloaded += 1
-
                 batch_tasks.clear()
                 await asyncio.sleep(PyroConf.FLOOD_WAIT_DELAY)
 
@@ -679,9 +813,16 @@ async def download_range(bot: Client, message: Message):
         f"❌ **Failed**     : `{failed}` error(s)"
     )
 
+# --------------- Fallback Handler for Plain Text Links ---------------
 
-@bot.on_message(filters.private & ~filters.command(["start", "help", "dl", "bdl", "dls", "bdls", "stats", "logs", "killall", "cleanup"]))
+@bot.on_message(filters.private & ~filters.command(["start", "help", "dl", "bdl", "dls", "bdls",
+                                                       "stats", "logs", "killall", "cleanup",
+                                                       "login", "logout", "cancel"]))
 async def handle_any_message(bot: Client, message: Message):
+    # If user is in a login conversation, the login handler already dealt with it, but just in case:
+    if get_login_state(message.from_user.id) is not None:
+        return
+
     if message.text and not message.text.startswith("/"):
         text = message.text.strip()
         if is_story_link(text):
@@ -689,6 +830,7 @@ async def handle_any_message(bot: Client, message: Message):
         else:
             await track_task(handle_download(bot, message, text))
 
+# --------------- Stats, Logs, Killall ---------------
 
 @bot.on_message(filters.command("stats") & filters.private)
 async def stats(_, message: Message):
@@ -719,14 +861,12 @@ async def stats(_, message: Message):
     )
     await message.reply(stats)
 
-
 @bot.on_message(filters.command("logs") & filters.private)
 async def logs(_, message: Message):
     if os.path.exists("logs.txt"):
         await message.reply_document(document="logs.txt", caption="**Logs**")
     else:
         await message.reply("**Not exists**")
-
 
 @bot.on_message(filters.command("killall") & filters.private)
 async def cancel_all_tasks(_, message: Message):
@@ -737,10 +877,20 @@ async def cancel_all_tasks(_, message: Message):
             cancelled += 1
     await message.reply(f"**Cancelled {cancelled} running task(s).**")
 
+# --------------- Initialization & Startup ---------------
 
 async def initialize():
     global download_semaphore, forward_chat_id
     download_semaphore = asyncio.Semaphore(PyroConf.MAX_CONCURRENT_DOWNLOADS)
+
+    # Quick MongoDB connection check
+    from helpers.user_sessions import sessions_col
+    try:
+        await sessions_col.find_one()
+        LOGGER(__name__).info("MongoDB connection established.")
+    except Exception as e:
+        LOGGER(__name__).error(f"MongoDB connection failed: {e}")
+        raise
 
     if PyroConf.FORWARD_CHAT_ID:
         forward_chat_id = await resolve_forward_chat_id(PyroConf.FORWARD_CHAT_ID)
@@ -750,7 +900,6 @@ if __name__ == "__main__":
     try:
         LOGGER(__name__).info("Bot Started!")
         asyncio.get_event_loop().run_until_complete(initialize())
-        user.start()
         bot.run()
     except KeyboardInterrupt:
         pass
